@@ -21,6 +21,16 @@ typedef struct {
     char* pty_name;
 } PtyContext;
 
+void write_all(Context *ctx, char ch)
+{
+    int rc, i;
+
+    for(i = 0; i < ctx->pty_count; i++ ) {
+        rc = write(ctx->pty_fds[i], &ch, 1);
+        printf("[%d] rc=%d\n", i, rc);
+    }
+}
+
 gboolean slave_read(int fd, GIOCondition condition, void* _ctx)
 {
     PtyContext *pctx = (PtyContext *)_ctx;
@@ -36,10 +46,12 @@ gboolean slave_read(int fd, GIOCondition condition, void* _ctx)
     }
 
     printf("[%d] 0x%x\n", pctx->index, buf);
+    write_all(pctx->ctx, buf);
     return TRUE;
 }
 
-void pty_context_free(void* _ctx) {
+void pty_context_free(void* _ctx)
+{
     PtyContext *pctx = (PtyContext *)_ctx;
     if(pctx) {
         g_free(pctx->pty_name);
@@ -47,11 +59,25 @@ void pty_context_free(void* _ctx) {
     }
 }
 
-bool raw_mode(int fd) {
+bool raw_mode(int fd)
+{
+    struct termios term;
+
+    tcgetattr(fd, &term);
+
+    term.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    term.c_oflag &= ~(OPOST);
+    term.c_cflag |= (CS8);
+    term.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+
+    term.c_cc[VMIN] = 1;
+    term.c_cc[VTIME] = 0;
+
+    tcsetattr(fd, TCSAFLUSH, &term);
     return true;
 }
 
-bool register_pty(int index, bool keep_alive, Context* ctx)
+bool register_pty(int index, bool keep_alive, bool raw, Context* ctx)
 {
     char *pts_name = NULL;
     int ptm, pts;
@@ -60,7 +86,7 @@ bool register_pty(int index, bool keep_alive, Context* ctx)
     pctx->index = index;
 
     /* Create the pty master: */
-    ptm = posix_openpt(O_RDWR | O_NOCTTY );
+    ptm = posix_openpt(O_RDWR | O_NOCTTY);
     grantpt(ptm);
     unlockpt(ptm);
 
@@ -74,7 +100,8 @@ bool register_pty(int index, bool keep_alive, Context* ctx)
     }
 
     /* Change to raw mode */
-    raw_mode(ptm);
+    if( raw )
+        raw_mode(ptm);
 
     g_unix_fd_add_full(G_PRIORITY_DEFAULT, ptm, G_IO_IN, slave_read, pctx,
                        pty_context_free);
@@ -85,18 +112,22 @@ bool register_pty(int index, bool keep_alive, Context* ctx)
 int main(int argc, char* argv[])
 {
     int opt;
-    int i, count;
+    int i, count = 2;
     bool keep_alive = true;
+    bool raw = true;
     Context ctx;
 
     /* Option parsing: */
-    while ((opt = getopt(argc, argv, "n:vk")) != -1) {
+    while ((opt = getopt(argc, argv, "n:vkr")) != -1) {
         switch(opt) {
         case 'n':
             count = atoi(optarg);
             break;
         case 'k':
             keep_alive = false;
+            break;
+        case 'r':
+            raw = false;
             break;
         default:
             fprintf(stderr, "Usage: %s [-n COUNT] [-v] [-k] [/dev/ttyXXX]\n",
@@ -115,9 +146,13 @@ int main(int argc, char* argv[])
     ctx.pty_count = count;
 
     for(i = 0; i < count; i++) {
-        register_pty(i, keep_alive, &ctx);
+        register_pty(i, keep_alive, raw, &ctx);
     }
 
+    for( i = 0; i < (1024 * 1024); i++) {
+        printf("0x%x\n", i);
+        write_all(&ctx, 'a');
+    }
     GMainLoop *loop = g_main_loop_new(NULL, false);
     g_main_loop_run(loop);
 
