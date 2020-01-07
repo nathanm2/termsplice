@@ -10,74 +10,96 @@
 #include <glib.h>
 #include <glib-unix.h>
 
-int verbosity = 0;
+typedef struct {
+    int pty_count;
+    int *pty_fds;  /* Array of master PTY handles. */
+} Context;
 
 typedef struct {
+    Context *ctx;
     int index;
-    char* slave;
+    char* pty_name;
 } PtyContext;
 
 gboolean slave_read(int fd, GIOCondition condition, void* _ctx)
 {
-    PtyContext *ctx = (PtyContext *)_ctx;
+    PtyContext *pctx = (PtyContext *)_ctx;
     char buf;
-    int rc;
+    int rc = read(fd, &buf, 1);
 
-    rc = read(fd, &buf, 1);
-    if (rc <= 0) {
-        printf("PTY[%d]: Error encountered: %d\n", ctx->index, rc);
+    if (rc < 0) {
+        if (errno == EIO)
+            printf("[%d] Slave closed.\n", pctx->index);
+        else
+            printf("[%d] errno=%d %s\n", pctx->index, errno, strerror(errno));
         return FALSE;
-    } else {
-        printf("[%d] 0x%x\n", ctx->index, buf);
     }
+
+    printf("[%d] 0x%x\n", pctx->index, buf);
     return TRUE;
 }
 
 void pty_context_free(void* _ctx) {
-    PtyContext *ctx = (PtyContext *)_ctx;
-    if(ctx) {
-        g_free(ctx->slave);
-        g_free(ctx);
+    PtyContext *pctx = (PtyContext *)_ctx;
+    if(pctx) {
+        g_free(pctx->pty_name);
+        g_free(pctx);
     }
 }
 
-bool register_pty(int index)
+bool raw_mode(int fd) {
+    return true;
+}
+
+bool register_pty(int index, bool keep_alive, Context* ctx)
 {
     char *pts_name = NULL;
     int ptm, pts;
-    PtyContext* ctx = g_new0(PtyContext, 1);
-    ctx->index = index;
+    PtyContext* pctx = g_new0(PtyContext, 1);
+    pctx->ctx = ctx;
+    pctx->index = index;
 
     /* Create the pty master: */
-    ptm = posix_openpt(O_RDWR | O_NOCTTY);
+    ptm = posix_openpt(O_RDWR | O_NOCTTY );
     grantpt(ptm);
     unlockpt(ptm);
 
-    ctx->slave = g_strdup(ptsname(ptm));
-    printf("PTY Slave[%i]: %s\n", index, ctx->slave);
-    open(ctx->slave, O_RDWR);
+    pctx->pty_name = g_strdup(ptsname(ptm));
+    printf("PTY Slave[%i]: %s\n", index, pctx->pty_name);
 
-    g_unix_fd_add_full(G_PRIORITY_DEFAULT, ptm, G_IO_IN, slave_read, ctx,
+    /* EIO is returned when the last slave handle has been closed.  To prevent
+     * this keep a slave handle open. */
+    if (keep_alive) {
+        open(pctx->pty_name, O_RDWR);
+    }
+
+    /* Change to raw mode */
+    raw_mode(ptm);
+
+    g_unix_fd_add_full(G_PRIORITY_DEFAULT, ptm, G_IO_IN, slave_read, pctx,
                        pty_context_free);
+    ctx->pty_fds[index] = ptm;
     return true;
 }
 
 int main(int argc, char* argv[])
 {
     int opt;
-    int i, count = 2;
+    int i, count;
+    bool keep_alive = true;
+    Context ctx;
 
     /* Option parsing: */
-    while ((opt = getopt(argc, argv, "n:v")) != -1) {
+    while ((opt = getopt(argc, argv, "n:vk")) != -1) {
         switch(opt) {
         case 'n':
             count = atoi(optarg);
             break;
-        case 'v':
-            verbosity++;
+        case 'k':
+            keep_alive = false;
             break;
         default:
-            fprintf(stderr, "Usage: %s [-n COUNT] [-v] [/dev/ttyXXX]\n",
+            fprintf(stderr, "Usage: %s [-n COUNT] [-v] [-k] [/dev/ttyXXX]\n",
                     argv[0]);
             exit(-1);
         }
@@ -89,8 +111,11 @@ int main(int argc, char* argv[])
         exit(-1);
     }
 
+    ctx.pty_fds = g_new(int, count);
+    ctx.pty_count = count;
+
     for(i = 0; i < count; i++) {
-        register_pty(i);
+        register_pty(i, keep_alive, &ctx);
     }
 
     GMainLoop *loop = g_main_loop_new(NULL, false);
